@@ -1,4 +1,6 @@
 import json
+import shutil
+from collections import Counter
 from os import path
 from datetime import datetime
 import sys
@@ -8,37 +10,49 @@ imageHost = ''
 if len(sys.argv) > 1:
     imageHost = sys.argv[1]
 
-with open("archive/outbox.json", "r") as outbox_file:
+with open("archive/outbox.json", "r", encoding="utf-8") as outbox_file:
     outbox = json.loads(outbox_file.read())
 
-with open("archive/actor.json", "r") as actor_file:
+with open("archive/actor.json", "r", encoding="utf-8") as actor_file:
     actor = json.loads(actor_file.read())
 
 # map the outbox down to the actual objects
 statuses = [status.get("object") for status in outbox.get("orderedItems")]
 
 articles = []
-hashtags = []
-# attachment urls may begin with "/media/" or something else we dont want
-# start with an offset of 1 to avoid checking root for /media or something else wrong
-pathOffset = 1
+# Count every hashtag occurrence (case-sensitive) and remember its href.
+hashtagCounts = Counter()
+hashtagHrefs = {}
 
-# Minify the HTML content by removing unnecessary whitespace and line breaks
+# Minify the HTML content by removing unnecessary whitespace and line breaks.
+# Content inside <pre> blocks is preserved so code/preformatted toots keep their
+# original whitespace.
 def minify_html(html):
+    preBlocks = []
+
+    def _stash(match):
+        preBlocks.append(match.group(0))
+        return "\x00PRE{0}\x00".format(len(preBlocks) - 1)
+
+    html = re.sub(r"<pre\b.*?</pre>", _stash, html, flags=re.DOTALL | re.IGNORECASE)
     html = re.sub(r">\s+<", "><", html)  # Remove whitespace between tags
     html = re.sub(r"\s+", " ", html)    # Collapse multiple spaces into one
+
+    for index, block in enumerate(preBlocks):
+        html = html.replace("\x00PRE{0}\x00".format(index), block)
     return html
 
 for status in statuses:
     # need to ignore objects that arent status dicts
-    if type(status) == type({}):
+    if isinstance(status, dict):
         if not "https://www.w3.org/ns/activitystreams#Public" in (status.get("to", []) + status.get("cc", [])):
             # Toot is not public, let's not output it.
             continue
         # get the date from the statuses (eg. 2024-01-15T16:52:47Z)
         date = status.get("published")
-        # convert the date string to a datetime object
-        date_obj = datetime.strptime(date, "%Y-%m-%dT%H:%M:%SZ")
+        # convert the date string to a datetime object, tolerating fractional
+        # seconds and timezone offsets (e.g. 2024-01-15T16:52:47.123+00:00)
+        date_obj = datetime.fromisoformat(date.replace("Z", "+00:00"))
         # format the datetime object to a more human-readable format
         date = date_obj.strftime("%B %d, %Y")
 
@@ -46,14 +60,18 @@ for status in statuses:
 
         htmlContent = status.get("content")
 
-        # Find all the anchor tags with the class .hashtag and push them to the hashtags array
-        for hashtag in status.get("tag"):
+        # Find all the Hashtag tags and record them (case-sensitive) with their href
+        for hashtag in status.get("tag", []):
             if hashtag.get("type") == "Hashtag":
-                # Check if the hashtag is already in the array
-                if hashtag.get("name") not in hashtags:
-                  hashtags.append("<a href='{0}'>{1}</a>".format(hashtag.get("href"), hashtag.get("name")))
+                name = hashtag.get("name")
+                hashtagCounts[name] += 1
+                hashtagHrefs.setdefault(name, hashtag.get("href"))
 
-        attachments = [attachment.get("url") for attachment in status.get("attachment")]
+        attachments = [
+            attachment.get("url")
+            for attachment in status.get("attachment", [])
+            if attachment.get("url")
+        ]
 
         images = ""
         for imageURL in attachments:
@@ -74,24 +92,25 @@ for status in statuses:
 
         articles.append(article)
 
-outfile = open("docs/index.html", "w")
-
-# Check if the folder has an "avatar.{jpg,png,wepb}" and copy it to the docs folder
+# Check if the folder has an "avatar.{jpg,png,webp}" and copy it to the docs folder
 assetExtensions = ["jpg", "png", "webp"]
 avatarExt = None
 for ext in assetExtensions:
     avatarPath = "archive/avatar." + ext
     if path.exists(avatarPath):
         avatarExt = ext
-        with open(avatarPath, "rb") as avatarFile:
-            with open("docs/avatar." + ext, "wb") as outAvatarFile:
-                outAvatarFile.write(avatarFile.read())
+        shutil.copyfile(avatarPath, "docs/avatar." + ext)
         break
 
 # Build avatar image HTML conditionally
 avatarImgHtml = ""
 if avatarExt:
   avatarImgHtml = '<div><img class="avatar" src="./avatar.%s" alt="Avatar of %s"></div>' % (avatarExt, actor.get("name"))
+
+# Extract the instance host from the actor URL, with a safe fallback.
+actorUrl = actor.get("url", "")
+hostMatch = re.search(r"https?://([^/]+)", actorUrl)
+instanceHost = hostMatch.group(1) if hostMatch else ""
 
 header = """<!DOCTYPE html>
 <html lang="en">
@@ -119,36 +138,23 @@ header = """<!DOCTYPE html>
     actor.get("name"),
     actor.get("url"),
     actor.get("preferredUsername"),
-    re.search(r"https://([^/]+)/", actor.get("url")).group(1),
+    instanceHost,
     "{:,}".format(len(articles))
 )
 
-# Order the hashtags alphabetically
-hashtags.sort()
-
-# Create a new list of unique hashtags and the number of times they appear
-uniqueHashtags = []
-uniqueHashtagsOutput = []
-for hashtag in hashtags:
-  if hashtag not in uniqueHashtags:
-    uniqueHashtags.append(hashtag)
-    uniqueHashtagsOutput.append(hashtag + " ({0})".format(hashtags.count(hashtag)))
+# Order the hashtags alphabetically by name (case-sensitive)
+uniqueHashtags = sorted(hashtagCounts)
 
 # Add the hashtags to the header
 header += "<details class='hashtags-accordion'><summary>Hashtags ({0})</summary><ul class='hashtags'>".format(len(uniqueHashtags))
 
-for hashtag in uniqueHashtagsOutput:
-    header += "<li>"
-    header += hashtag
-    header += "</li>"
+for name in uniqueHashtags:
+    anchor = "<a href='{0}'>{1}</a>".format(hashtagHrefs.get(name, ""), name)
+    header += "<li>{0} ({1})</li>".format(anchor, hashtagCounts[name])
 header += "</ul></details>"
 
 header += "<div class='items'>"
 header = minify_html(header)
-outfile.write(header)
-
-for article in reversed(articles):
-    outfile.write(minify_html(article))
 
 footer = """
     </div>
@@ -161,6 +167,9 @@ footer = """
 </body>
 </html>"""
 footer = minify_html(footer)
-outfile.write(footer)
 
-outfile.close()
+with open("docs/index.html", "w", encoding="utf-8") as outfile:
+    outfile.write(header)
+    for article in reversed(articles):
+        outfile.write(minify_html(article))
+    outfile.write(footer)
