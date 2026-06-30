@@ -171,5 +171,5 @@ footer = minify_html(footer)
 with open("docs/index.html", "w", encoding="utf-8") as outfile:
     outfile.write(header)
     for article in reversed(articles):
-        outfile.write(minify_html(article))
+        outfile.write(article)
     outfile.write(footer)
